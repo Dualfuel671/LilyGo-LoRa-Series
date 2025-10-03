@@ -73,6 +73,7 @@ static RTC_DATA_ATTR uint32_t bootCounter = 0; // survives soft resets
 
 // Forward decl
 static void logResetInfo();
+static bool pmuReady = false; // track PMU presence for display line
 
 #ifdef USE_FSK_300
 // RadioLib FSK instance (NOTE: pin mapping adapted; DIO0 used for packet done)
@@ -267,6 +268,33 @@ void setup() {
   stageStart();
   Wire.begin(I2C_SDA, I2C_SCL); // temporary for PMU detection (AXP2101 also on this bus)
   Wire.setClock(400000);        // speed up I2C (panel handles 400kHz)
+  // Detect and enable required rails before any radio/display heavy init
+  pmu2101 = new XPowersAXP2101(Wire);
+  if (pmu2101 && pmu2101->init()) {
+    pmuReady = true;
+    Serial.println(F("[PMU] AXP2101 detected"));
+    pmu2101->setALDO4Voltage(3300); pmu2101->enableALDO4();
+    pmu2101->setALDO2Voltage(3300); pmu2101->enableALDO2();
+    pmu2101->setDC3Voltage(3300);   pmu2101->enableDC3();
+    pmu2101->setDC5Voltage(3300);   pmu2101->enableDC5();
+    pmu2101->setALDO1Voltage(3300); pmu2101->enableALDO1();
+    pmu2101->setALDO3Voltage(3300); pmu2101->enableALDO3();
+  } else {
+    delete pmu2101; pmu2101 = nullptr;
+    pmu192 = new XPowersAXP192(Wire);
+    if (pmu192 && pmu192->init()) {
+      pmuReady = true;
+      Serial.println(F("[PMU] AXP192 detected"));
+      pmu192->setLDO2Voltage(3300); pmu192->enableLDO2();
+      pmu192->setLDO3Voltage(3300); pmu192->enableLDO3();
+    } else {
+      delete pmu192; pmu192 = nullptr;
+    }
+  }
+  if (!pmuReady) Serial.println(F("[PMU] Not found (continuing)"));
+  delay(50);
+  stageLog("PMU + rails");
+
   // Initialize radio according to mode
 #ifdef USE_FSK_300
   {
@@ -343,24 +371,6 @@ void setup() {
       Serial.printf("[I2C] 0x%02X\n", a); devs++; }
   }
   if (!devs) Serial.println(F("[I2C] No devices found"));
-#ifdef USE_FSK_300
-    if (fskMode) {
-      String info = String("FC=") + frameCounter + " UPT=" + now + "ms CALL=" + MY_CALLSIGN;
-      int txState = fskRadio.transmit(info);
-      if (txState == RADIOLIB_ERR_NONE) {
-        Serial.printf("[TX] FSK txt len=%u\n", (unsigned)info.length());
-        Serial.print("[TX] Info: "); Serial.println(info);
-        char l2[18]; snprintf(l2, sizeof(l2), "FC:%lu", (unsigned long)frameCounter);
-        char l3[18]; strncpy(l3, info.c_str(), 17); l3[17] = '\0';
-        oledLines("FSK Sent", l2, l3, "FSK TXT");
-      } else {
-        Serial.printf("[ERR] FSK TX code=%d\n", txState);
-        oledLines("FSK TX","FAILED");
-      }
-      delay(10);
-      return;
-    }
-#endif
   stageLog("I2C scan complete");
 
   stageStart();
@@ -374,52 +384,7 @@ void setup() {
 
   // (Countdown previously here was removed intentionally.)
 
-  // Initialize SPI bus for radio
-  SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
-
-  // Power enables
-  pinMode(RADIO_LDO_EN, OUTPUT);
-  digitalWrite(RADIO_LDO_EN, HIGH);  // Enable radio LDO (if tied)
-
-  pinMode(RADIO_CTRL, OUTPUT);
-  digitalWrite(RADIO_CTRL, LOW);     // Select TX path for beaconing
-
-  // Initialize LoRa radio
-  LoRa.setPins(RADIO_CS_PIN, RADIO_RST_PIN, RADIO_DIO0_PIN);
-  if (!LoRa.begin((long)(CONFIG_RADIO_FREQ * 1000000))) {
-    Serial.println(F("[ERR] LoRa init failed"));
-    while (true) { delay(1000); }
-  }
-
-  LoRa.setTxPower(CONFIG_RADIO_OUTPUT_POWER);
-  LoRa.setSignalBandwidth((long)(CONFIG_RADIO_BW * 1000));
-  LoRa.setSpreadingFactor(9);      // SF9 (moderate airtime)
-  LoRa.setCodingRate4(5);          // 4/5
-  LoRa.setPreambleLength(8);
-  LoRa.enableCrc();
-
-  Serial.printf("[INFO] Ready @ %.3f MHz BW=%.1f kHz Power=%d dBm\n",
-                CONFIG_RADIO_FREQ, CONFIG_RADIO_BW, CONFIG_RADIO_OUTPUT_POWER);
-  oledLines("Ready", "Freq 145.10", MY_CALLSIGN, "Int 60s");
-  // Force immediate first beacon transmission right here instead of waiting for loop()
-  {
-    frameCounter = 1;
-    String info = String("FC=") + frameCounter + " UPT=0ms CALL=" + MY_CALLSIGN;
-    uint8_t frame[255];
-    size_t flen = build_ax25_ui(frame, sizeof(frame), info);
-    if (flen) {
-      LoRa.beginPacket();
-      LoRa.write(frame, flen);
-      LoRa.endPacket();
-      Serial.printf("[TX-IMMEDIATE] AX25 len=%u infoLen=%u\n", (unsigned)flen, (unsigned)info.length());
-      Serial.print("[TX-IMMEDIATE] Info: "); Serial.println(info);
-      oledLines("Sent0", "FC:1", info.c_str(), "LoRa AX25");
-      firstBeaconSent = true;
-      lastSend = millis();
-    } else {
-      Serial.println(F("[ERR] Immediate beacon build failed"));
-    }
-  }
+  // (Radio SPI bus already active earlier for both modes)
 }
 
 void loop() {
