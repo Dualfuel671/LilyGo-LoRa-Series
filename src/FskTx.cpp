@@ -1,10 +1,15 @@
 // FskTx.cpp - Dedicated low-bitrate FSK transmitter for T-Beam BPF (ESP32-S3 + SX1278)
 // Generates structured ASCII payload frames with CRC-16 X.25.
-// Frame format: $BPF,<fc>,<upt_ms>,<vbat_mv>,<last_rssi>,<tempC>*XXXX\n
+// Frame format (extended):
+// $BPF,<fc>,<upt_ms>,<vbat_mv>,<last_rssi>,<tempC>,Vhhhh,Ps*XXXX\n
+//  - Vhhhh: 4-hex version tag (compile-time VERSION_TAG or derived)
+//  - Ps: power source code (B=battery present, E=external/no battery, ?=unknown)
+// CRC-16 X.25 over body between '$' and '*'.
 // DISCLAIMER: Experimental beacon, not an AX.25 compatible on-air signal.
 
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <SPI.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <XPowersLib.h>
@@ -26,7 +31,18 @@
 #define CONFIG_RADIO_FREQ 144.0f   // MHz (adjust as needed)
 #endif
 
-static const unsigned BEACON_INTERVAL_MS = 60000; // 60s
+#ifndef CONFIG_FSK_INTERVAL_MS
+#define CONFIG_FSK_INTERVAL_MS 60000UL
+#endif
+
+#ifndef VERSION_TAG
+// Fallback version tag: simple hash of build date/time
+static constexpr uint16_t fallbackVersionTag = \
+  ((uint16_t)(__DATE__[4] + __TIME__[6] + __TIME__[7]) << 8) ^ (uint16_t)(__DATE__[0] + __TIME__[0]);
+#define VERSION_TAG fallbackVersionTag
+#endif
+
+static const unsigned BEACON_INTERVAL_MS = CONFIG_FSK_INTERVAL_MS;
 static uint32_t frameCounter = 0;
 static unsigned long lastSend = 0;
 static bool firstTx = false;
@@ -40,13 +56,18 @@ static bool pmuReady = false;
 // FSK radio
 static Module fskModule(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
 static SX1278 fskRadio(&fskModule);
-static const float FSK_TARGET_BITRATE = 0.3f;   // kbps
-static const float FSK_FALLBACK_BITRATE = 0.6f; // kbps
+static const float FSK_TARGET_BITRATE = 0.3f;   // kbps (300 bps attempt)
+static const float FSK_FALLBACK_BITRATE = 0.6f; // kbps (fallback 600 bps)
 static const float FSK_DEV_KHZ = 0.6f;
 static const float FSK_RXBW_KHZ = 5.0f;
 static uint16_t lastFSKRSSI = 0;
 static uint16_t lastVBat_mV = 0;
-static float fakeTempC = 0.0f;
+static float fakeTempC = 0.0f; // placeholder for future real sensor
+static float configuredKbps = FSK_TARGET_BITRATE; // record chosen bitrate
+
+#ifndef STATUS_LED_PIN
+#define STATUS_LED_PIN 38
+#endif
 
 // CRC-16 X.25
 static uint16_t crc_x25(const uint8_t *data, size_t len) {
@@ -84,13 +105,28 @@ static uint16_t readBatteryMilliVolts(){
   return 0;
 }
 
+static char detectPowerSourceCode(){
+  if(pmu2101){
+    bool battPresent = pmu2101->isBatteryConnect();
+    if(battPresent) return 'B';
+    return 'E';
+  }
+  if(pmu192){
+    bool battPresent = pmu192->isBatteryConnect();
+    if(battPresent) return 'B';
+    return 'E';
+  }
+  return '?';
+}
+
 static size_t buildPayload(char *out,size_t maxLen,uint32_t fc,uint32_t uptime){
   lastVBat_mV = readBatteryMilliVolts();
-  char body[160];
-  snprintf(body,sizeof(body),"BPF,%lu,%lu,%u,%u,%.1f",(unsigned long)fc,(unsigned long)uptime,
-           (unsigned)lastVBat_mV,(unsigned)lastFSKRSSI,fakeTempC);
+  char body[192];
+  char psrc = detectPowerSourceCode();
+  snprintf(body,sizeof(body),"BPF,%lu,%lu,%u,%u,%.1f,V%04X,P%c",(unsigned long)fc,(unsigned long)uptime,
+           (unsigned)lastVBat_mV,(unsigned)lastFSKRSSI,fakeTempC,(unsigned)VERSION_TAG, psrc);
   uint16_t c = crc_x25((const uint8_t*)body, strlen(body));
-  char frame[192];
+  char frame[224];
   snprintf(frame,sizeof(frame),"$%s*%04X\n",body,c & 0xFFFF);
   size_t flen = strlen(frame);
   if(flen+1>maxLen) return 0; memcpy(out,frame,flen+1); return flen;
@@ -142,10 +178,15 @@ void setup(){
 
   // Init FSK radio
   Serial.println(F("[RADIO] Init FSK"));
+  // RadioLib handles SPI internally; explicit SPI.begin() not required unless custom pins diverge.
+  pinMode(STATUS_LED_PIN, OUTPUT); digitalWrite(STATUS_LED_PIN, LOW);
+
+  configuredKbps = FSK_TARGET_BITRATE; // track what we end up using
   int state = fskRadio.beginFSK(CONFIG_RADIO_FREQ, FSK_TARGET_BITRATE, FSK_DEV_KHZ, FSK_RXBW_KHZ);
   if(state != RADIOLIB_ERR_NONE){
     Serial.printf("[RADIO] 300bps fail (%d) fallback 600bps\n", state);
     state = fskRadio.beginFSK(CONFIG_RADIO_FREQ, FSK_FALLBACK_BITRATE, FSK_DEV_KHZ, FSK_RXBW_KHZ);
+    if(state == RADIOLIB_ERR_NONE) configuredKbps = FSK_FALLBACK_BITRATE;
   }
   if(state != RADIOLIB_ERR_NONE){
     Serial.printf("[ERR] FSK init failed code=%d\n", state);
@@ -153,15 +194,18 @@ void setup(){
   }
   fskRadio.setPreambleLength(16);
   fskRadio.setCRC(true);
-  Serial.println(F("[RADIO] FSK ready"));
-  oledLines("FSK Ready","Freq OK","Bitrate", "");
+  Serial.printf("[RADIO] FSK ready @ %.3f MHz BR=%.0f bps\n", CONFIG_RADIO_FREQ, configuredKbps*1000.0f);
+  char line3[22]; snprintf(line3,sizeof(line3),"BR=%.0f", configuredKbps*1000.0f);
+  oledLines("FSK Ready","Freq OK", line3, "");
 
   // Immediate first frame
   frameCounter = 1;
   char payload[192];
   size_t plen = buildPayload(payload, sizeof(payload), frameCounter, 0);
-  if(plen){
-    int tx = fskRadio.transmit(payload);
+    if(plen){
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      int tx = fskRadio.transmit(payload);
+      digitalWrite(STATUS_LED_PIN, LOW);
     if(tx == RADIOLIB_ERR_NONE){
       Serial.printf("[TX0] len=%u %s", (unsigned)plen, payload);
       oledLines("Sent0","FC:1", payload, "");
@@ -180,7 +224,9 @@ void loop(){
     char payload[192];
     size_t plen = buildPayload(payload,sizeof(payload),frameCounter,now);
     if(plen){
+      digitalWrite(STATUS_LED_PIN, HIGH);
       int tx = fskRadio.transmit(payload);
+      digitalWrite(STATUS_LED_PIN, LOW);
       if(tx == RADIOLIB_ERR_NONE){
         Serial.printf("[TX] FC=%lu len=%u %s", (unsigned long)frameCounter, (unsigned)plen, payload);
         char l2[20]; snprintf(l2,sizeof(l2),"FC:%lu", (unsigned long)frameCounter);

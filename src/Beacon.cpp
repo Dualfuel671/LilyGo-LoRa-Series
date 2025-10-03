@@ -58,6 +58,9 @@ static const size_t DIGI_PATH_COUNT = sizeof(DIGI_PATH)/sizeof(DIGI_PATH[0]);
 // ---------------- Mode Selection ----------------
 // Define USE_FSK_300 to build a narrowband ~300 bps (fallback 600 bps) FSK beacon instead of LoRa CSS.
 // Add to build flags: -DUSE_FSK_300
+// Forward declare CRC used by both AX.25 and FSK framing before FSK helpers when compiled early.
+static uint16_t ax25_crc(const uint8_t* data, size_t len); // actual definition appears later
+
 #ifdef USE_FSK_300
 #define MODE_NAME "FSK300"
 #else
@@ -75,6 +78,12 @@ static RTC_DATA_ATTR uint32_t bootCounter = 0; // survives soft resets
 static void logResetInfo();
 static bool pmuReady = false; // track PMU presence for display line
 
+// Early forward declarations (will allocate later in setup). Define as raw pointers here.
+class U8G2; // forward class
+static U8G2 *u8g2ptr = nullptr; // will point to a created instance
+static XPowersAXP2101 *pmu2101 = nullptr; // allocated in setup if detected
+static XPowersAXP192  *pmu192  = nullptr; // fallback older PMU
+
 #ifdef USE_FSK_300
 // RadioLib FSK instance (NOTE: pin mapping adapted; DIO0 used for packet done)
 // NSS, DIO0, RESET, DIO1
@@ -86,12 +95,75 @@ static const float FSK_FALLBACK_BITRATE = 0.6f; // kbps (600 bps)
 static const float FSK_DEV_KHZ = 0.6f;          // kHz deviation (~600 Hz)
 static const float FSK_RXBW_KHZ = 5.0f;         // kHz receiver bandwidth
 static bool fskMode = false;
+
+// Simple ASCII payload framing for FSK mode:
+// $BPF,<fc>,<upt_ms>,<vbat_mv>,<rssi_prev>,<tempC if available>*XXXX\n
+// Where *XXXX is 4 hex digits of CRC-16 X25 over everything after '$' up to but not including '*'.
+// (Reuse ax25_crc for convenience.)
+static uint16_t lastFSKRSSI = 0;
+static float fakeTempC = 0; // placeholder for future sensor integration
+static uint16_t lastVBat_mV = 0;
+
+static uint16_t readBatteryMilliVolts() {
+  // Best effort: if PMU present, query; else return 0 (not available)
+  if (pmu2101) {
+    // XPowersLib AXP2101 exposes getBattVoltage() in mV if battery detected; guard usage
+    return (uint16_t)pmu2101->getBattVoltage();
+  }
+  if (pmu192) {
+    return (uint16_t)pmu192->getBattVoltage();
+  }
+  return 0;
+}
+
+static size_t build_fsk_payload(char *out, size_t maxLen, uint32_t fc, uint32_t uptimeMs) {
+  lastVBat_mV = readBatteryMilliVolts();
+  // Compose body without leading '$' and without CRC first
+  // Format: BPF,fc,upt,vbat,rssi,temp
+  char body[160];
+  snprintf(body, sizeof(body), "BPF,%lu,%lu,%u,%u,%.1f", (unsigned long)fc, (unsigned long)uptimeMs,
+           (unsigned)lastVBat_mV, (unsigned)lastFSKRSSI, fakeTempC);
+  uint16_t crc = ax25_crc((const uint8_t*)body, strlen(body));
+  char frame[192];
+  snprintf(frame, sizeof(frame), "$%s*%04X\n", body, crc & 0xFFFF);
+  size_t flen = strlen(frame);
+  if (flen + 1 > maxLen) return 0;
+  memcpy(out, frame, flen + 1);
+  return flen;
+}
+
+// Parse an incoming FSK payload according to the framing above.
+// Returns true if CRC is valid and fields parsed.
+static bool parse_fsk_payload(const char *in, uint32_t &fc, uint32_t &upt, uint16_t &vbat, uint16_t &rssi, float &temp, uint16_t &crcCalc, uint16_t &crcField) {
+  fc = upt = vbat = rssi = 0; temp = 0; crcCalc = crcField = 0;
+  size_t len = strlen(in);
+  if (len < 10) return false; // too short
+  if (in[0] != '$') return false;
+  const char *star = strrchr(in, '*');
+  if (!star || star - in < 5 || (len - (star - in) - 1) < 4) return false;
+  // Extract CRC field
+  if (sscanf(star + 1, "%4hx", &crcField) != 1) return false;
+  // Body between '$' and '*'
+  char body[170];
+  size_t bodyLen = (size_t)(star - (in + 1));
+  if (bodyLen >= sizeof(body)) return false;
+  memcpy(body, in + 1, bodyLen); body[bodyLen] = '\0';
+  crcCalc = ax25_crc((const uint8_t*)body, bodyLen);
+  if (crcCalc != crcField) return false;
+  // Split fields: BPF,fc,upt,vbat,rssi,temp
+  // Use sscanf with defensive matching
+  char tag[8];
+  double tempD = 0.0;
+  unsigned long fcUL=0, uptUL=0; unsigned vbatU=0, rssiU=0;
+  int matched = sscanf(body, "%7[^,],%lu,%lu,%u,%u,%lf", tag, &fcUL, &uptUL, &vbatU, &rssiU, &tempD);
+  if (matched < 6) return false;
+  if (strcmp(tag, "BPF") != 0) return false;
+  fc = (uint32_t)fcUL; upt = (uint32_t)uptUL; vbat = (uint16_t)vbatU; rssi = (uint16_t)rssiU; temp = (float)tempD;
+  return true;
+}
 #endif
 
-// Display (initially null until we know the controller responds)
-static U8G2 *u8g2ptr = nullptr; // will point to a created instance
-static XPowersAXP2101 *pmu2101 = nullptr;
-static XPowersAXP192  *pmu192  = nullptr;
+// (moved declarations above for visibility)
 
 // Build flag to try SSD1306 first (or fallback). Usage: add -DTRY_SSD1306_FALLBACK=1
 #ifndef TRY_SSD1306_FALLBACK
@@ -312,21 +384,36 @@ void setup() {
     fskMode = true;
     fskRadio.setPreambleLength(16); // bytes
     fskRadio.setCRC(true);
-    fskRadio.setWhitening(true);
+  // Whitening not exposed for SX1278 in RadioLib 7.1.2; relying on default settings.
     Serial.println(F("[RADIO] FSK ready"));
     oledLines("FSK Ready", "300/600bps", MY_CALLSIGN, "Int 60s");
     // Immediate first frame (simple text, not AX.25 framing yet)
     frameCounter = 1;
-    String info = String("FC=") + frameCounter + " UPT=0ms CALL=" + MY_CALLSIGN;
-    int txState = fskRadio.transmit(info);
-    if (txState == RADIOLIB_ERR_NONE) {
-      Serial.printf("[TX-IMMEDIATE] FSK text len=%u\n", (unsigned)info.length());
-      Serial.print("[TX-IMMEDIATE] Info: "); Serial.println(info);
-      oledLines("FSK Sent0", "FC:1", info.c_str(), "FSK TXT");
-      firstBeaconSent = true; lastSend = millis();
-    } else {
-      Serial.printf("[ERR] Immediate FSK TX failed code=%d\n", txState);
-    }
+    #ifndef FSK_RECEIVER
+      char payload[192];
+      size_t plen = build_fsk_payload(payload, sizeof(payload), frameCounter, 0);
+      if (plen) {
+        int txState = fskRadio.transmit(payload);
+        if (txState == RADIOLIB_ERR_NONE) {
+          Serial.printf("[TX-IMMEDIATE] FSK payload len=%u\n", (unsigned)plen);
+          Serial.print("[TX-IMMEDIATE] Payload: "); Serial.print(payload);
+          oledLines("FSK Sent0", "FC:1", payload, "FSK CRC");
+          firstBeaconSent = true; lastSend = millis();
+        } else {
+          Serial.printf("[ERR] Immediate FSK TX failed code=%d\n", txState);
+        }
+      } else {
+        Serial.println(F("[ERR] FSK payload build failed"));
+      }
+    #else
+      // Receiver mode: put radio into continuous receive
+      Serial.println(F("[RADIO] Entering continuous FSK receive"));
+      int rxState = fskRadio.startReceive();
+      if (rxState != RADIOLIB_ERR_NONE) {
+        Serial.printf("[ERR] startReceive failed code=%d\n", rxState);
+      }
+      oledLines("FSK RX", "Waiting...", MY_CALLSIGN, "");
+    #endif
   }
 #else
   // LoRa path (original)
@@ -389,6 +476,65 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+#ifdef USE_FSK_300
+  #ifndef FSK_RECEIVER
+    // Periodic FSK payload transmission
+    if (now - lastSend >= BEACON_INTERVAL_MS) {
+      lastSend = now;
+      if (!firstBeaconSent) {
+        frameCounter = 0;
+        firstBeaconSent = true;
+      }
+      frameCounter++;
+      char payload[192];
+      size_t plen = build_fsk_payload(payload, sizeof(payload), frameCounter, now);
+      if (!plen) {
+        Serial.println(F("[ERR] FSK payload build failed (size)"));
+        oledLines("FSK build", "FAILED");
+      } else {
+        int txState = fskRadio.transmit(payload);
+        if (txState == RADIOLIB_ERR_NONE) {
+          Serial.printf("[TX] FSK len=%u\n", (unsigned)plen);
+          Serial.print("[TX] Payload: "); Serial.print(payload);
+          char l2[18]; snprintf(l2, sizeof(l2), "FC:%lu", (unsigned long)frameCounter);
+          oledLines("FSK Sent", l2, payload, "");
+        } else {
+          Serial.printf("[ERR] FSK TX fail code=%d\n", txState);
+          oledLines("FSK TX", "ERR");
+        }
+      }
+    }
+  #else
+    // Receiver polling: check for received packet
+    // RadioLib non-blocking approach: after startReceive(), poll available() using readData if needed.
+    String rx;
+    int16_t state = fskRadio.readData(rx);
+    if (state == RADIOLIB_ERR_NONE) {
+      // Validate framing & CRC
+      uint32_t fc=0, upt=0; uint16_t vbat=0, rssi=0; float temp=0; uint16_t crcCalc=0, crcField=0;
+      bool ok = parse_fsk_payload(rx.c_str(), fc, upt, vbat, rssi, temp, crcCalc, crcField);
+      int16_t rssiNow = fskRadio.getRSSI();
+      lastFSKRSSI = (uint16_t)(rssiNow < 0 ? -rssiNow : rssiNow);
+      if (ok) {
+        Serial.printf("[RX] OK FC=%lu UPT=%lu Vbat=%umV RSSI=%d Temp=%.1f CRC=%04X\n", (unsigned long)fc, (unsigned long)upt, vbat, (int)rssiNow, temp, crcField);
+        char l2[22]; snprintf(l2, sizeof(l2), "FC:%lu RSSI:%d", (unsigned long)fc, (int)rssiNow);
+        char l3[22]; snprintf(l3, sizeof(l3), "VBAT:%umV", vbat);
+        oledLines("FSK RX OK", l2, l3, "");
+      } else {
+        Serial.print("[RX] BAD "); Serial.println(rx);
+        oledLines("FSK RX BAD", "CRC/Parse", "", "");
+      }
+      // Restart receive
+      fskRadio.startReceive();
+    } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
+      // Unexpected error; attempt to restart
+      if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[RX] readData state=%d restarting\n", state);
+        fskRadio.startReceive();
+      }
+    }
+  #endif
+#else
   if (now - lastSend >= BEACON_INTERVAL_MS) {
     lastSend = now;
     if (!firstBeaconSent) {
@@ -416,6 +562,7 @@ void loop() {
     }
   }
   delay(10);
+#endif // USE_FSK_300
 }
 
 static const char* resetReasonToStr(esp_reset_reason_t r) {
