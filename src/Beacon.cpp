@@ -8,6 +8,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <RadioLib.h> // for FSK mode (SX127x)
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <XPowersLib.h> // PMU control for power rails (best effort)
@@ -54,6 +55,15 @@ struct Ax25PathEntry { const char* call; uint8_t ssid; };
 static Ax25PathEntry DIGI_PATH[] = { /* {"WIDE1",1}, {"WIDE2",2} */ };
 static const size_t DIGI_PATH_COUNT = sizeof(DIGI_PATH)/sizeof(DIGI_PATH[0]);
 
+// ---------------- Mode Selection ----------------
+// Define USE_FSK_300 to build a narrowband ~300 bps (fallback 600 bps) FSK beacon instead of LoRa CSS.
+// Add to build flags: -DUSE_FSK_300
+#ifdef USE_FSK_300
+#define MODE_NAME "FSK300"
+#else
+#define MODE_NAME "LoRa"
+#endif
+
 static const unsigned BEACON_INTERVAL_MS = 60000; // 60s main interval
 // (Removed early keepalive heartbeat)
 static uint32_t frameCounter = 0;
@@ -63,6 +73,19 @@ static RTC_DATA_ATTR uint32_t bootCounter = 0; // survives soft resets
 
 // Forward decl
 static void logResetInfo();
+
+#ifdef USE_FSK_300
+// RadioLib FSK instance (NOTE: pin mapping adapted; DIO0 used for packet done)
+// NSS, DIO0, RESET, DIO1
+static Module fskModule(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
+static SX1278 fskRadio(&fskModule);
+// Target parameters (attempt 300 bps; may fall back to 600 if unsupported by RadioLib internals)
+static const float FSK_TARGET_BITRATE = 0.3f;   // kbps (300 bps)
+static const float FSK_FALLBACK_BITRATE = 0.6f; // kbps (600 bps)
+static const float FSK_DEV_KHZ = 0.6f;          // kHz deviation (~600 Hz)
+static const float FSK_RXBW_KHZ = 5.0f;         // kHz receiver bandwidth
+static bool fskMode = false;
+#endif
 
 // Display (initially null until we know the controller responds)
 static U8G2 *u8g2ptr = nullptr; // will point to a created instance
@@ -228,7 +251,8 @@ void setup() {
   // If you do not see the next line in the serial monitor, it likely
   // printed before the monitor attached. Open the monitor first, then
   // press the board's RESET button to catch it.
-  Serial.println(F("[BOOT] T-Beam BPF LoRa pseudo-AX.25 Beacon"));
+  Serial.print(F("[BOOT] T-Beam BPF Beacon Mode="));
+  Serial.println(F(MODE_NAME));
   // ==================================================================
   bootCounter++;
   logResetInfo();
@@ -243,42 +267,71 @@ void setup() {
   stageStart();
   Wire.begin(I2C_SDA, I2C_SCL); // temporary for PMU detection (AXP2101 also on this bus)
   Wire.setClock(400000);        // speed up I2C (panel handles 400kHz)
-  bool pmuReady = false;
-  pmu2101 = new XPowersAXP2101(Wire);
-  if (pmu2101 && pmu2101->init()) {
-    pmuReady = true;
-    Serial.println(F("[PMU] AXP2101 detected"));
-    // Mirror Factory sequence for T_BEAM_S3_BPF (ALDO4 gps, ALDO2 sdcard, DCDC3 ext, DCDC5, ALDO1, plus we also keep ALDO3 optionally)
-    pmu2101->setALDO4Voltage(3300); pmu2101->enableALDO4();
-    pmu2101->setALDO2Voltage(3300); pmu2101->enableALDO2();
-    pmu2101->setDC3Voltage(3300);   pmu2101->enableDC3();
-    pmu2101->setDC5Voltage(3300);   pmu2101->enableDC5();
-    pmu2101->setALDO1Voltage(3300); pmu2101->enableALDO1();
-    // Some boards might also need ALDO3 – enable it too for safety
-    pmu2101->setALDO3Voltage(3300); pmu2101->enableALDO3();
-  } else {
-    delete pmu2101; pmu2101 = nullptr;
-    pmu192 = new XPowersAXP192(Wire);
-    if (pmu192 && pmu192->init()) {
-      pmuReady = true;
-      Serial.println(F("[PMU] AXP192 detected"));
-      pmu192->setLDO2Voltage(3300); pmu192->enableLDO2(); // LoRa
-      pmu192->setLDO3Voltage(3300); pmu192->enableLDO3(); // GPS
+  // Initialize radio according to mode
+#ifdef USE_FSK_300
+  {
+    Serial.println(F("[RADIO] Initializing FSK modem"));
+    // Disable LoRa library usage; we rely on RadioLib for FSK
+    int state = fskRadio.beginFSK(CONFIG_RADIO_FREQ, FSK_TARGET_BITRATE, FSK_DEV_KHZ, FSK_RXBW_KHZ);
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.printf("[RADIO] 300 bps attempt failed (code %d), trying 600 bps fallback\n", state);
+      state = fskRadio.beginFSK(CONFIG_RADIO_FREQ, FSK_FALLBACK_BITRATE, FSK_DEV_KHZ, FSK_RXBW_KHZ);
+    }
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.printf("[ERR] FSK init failed code=%d\n", state);
+      while(true) { delay(1000); }
+    }
+    fskMode = true;
+    fskRadio.setPreambleLength(16); // bytes
+    fskRadio.setCRC(true);
+    fskRadio.setWhitening(true);
+    Serial.println(F("[RADIO] FSK ready"));
+    oledLines("FSK Ready", "300/600bps", MY_CALLSIGN, "Int 60s");
+    // Immediate first frame (simple text, not AX.25 framing yet)
+    frameCounter = 1;
+    String info = String("FC=") + frameCounter + " UPT=0ms CALL=" + MY_CALLSIGN;
+    int txState = fskRadio.transmit(info);
+    if (txState == RADIOLIB_ERR_NONE) {
+      Serial.printf("[TX-IMMEDIATE] FSK text len=%u\n", (unsigned)info.length());
+      Serial.print("[TX-IMMEDIATE] Info: "); Serial.println(info);
+      oledLines("FSK Sent0", "FC:1", info.c_str(), "FSK TXT");
+      firstBeaconSent = true; lastSend = millis();
     } else {
-      delete pmu192; pmu192 = nullptr;
+      Serial.printf("[ERR] Immediate FSK TX failed code=%d\n", txState);
     }
   }
-  if (!pmuReady) Serial.println(F("[PMU] Not found (continuing)"));
-  delay(50); // rails settle
-  stageLog("PMU + rails");
-
-  // Re-init I2C cleanly now that rails are up
-  stageStart();
-  Wire.end();
-  delay(5);
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);
-  stageLog("I2C restart after rails");
+#else
+  // LoRa path (original)
+  LoRa.setPins(RADIO_CS_PIN, RADIO_RST_PIN, RADIO_DIO0_PIN);
+  if (!LoRa.begin((long)(CONFIG_RADIO_FREQ * 1000000))) {
+    Serial.println(F("[ERR] LoRa init failed"));
+    while (true) { delay(1000); }
+  }
+  LoRa.setTxPower(CONFIG_RADIO_OUTPUT_POWER);
+  LoRa.setSignalBandwidth((long)(CONFIG_RADIO_BW * 1000));
+  LoRa.setSpreadingFactor(9);
+  LoRa.setCodingRate4(5);
+  LoRa.setPreambleLength(8);
+  LoRa.enableCrc();
+  Serial.printf("[INFO] Ready @ %.3f MHz BW=%.1f kHz Power=%d dBm\n",
+                CONFIG_RADIO_FREQ, CONFIG_RADIO_BW, CONFIG_RADIO_OUTPUT_POWER);
+  oledLines("Ready", "Freq 145.10", MY_CALLSIGN, "Int 60s");
+  frameCounter = 1;
+  {
+    String info = String("FC=") + frameCounter + " UPT=0ms CALL=" + MY_CALLSIGN;
+    uint8_t frame[255];
+    size_t flen = build_ax25_ui(frame, sizeof(frame), info);
+    if (flen) {
+      LoRa.beginPacket(); LoRa.write(frame, flen); LoRa.endPacket();
+      Serial.printf("[TX-IMMEDIATE] AX25 len=%u infoLen=%u\n", (unsigned)flen, (unsigned)info.length());
+      Serial.print("[TX-IMMEDIATE] Info: "); Serial.println(info);
+      oledLines("Sent0", "FC:1", info.c_str(), "LoRa AX25");
+      firstBeaconSent = true; lastSend = millis();
+    } else {
+      Serial.println(F("[ERR] Immediate beacon build failed"));
+    }
+  }
+#endif
 
   // I2C scan (full) after rails
   stageStart();
@@ -290,6 +343,24 @@ void setup() {
       Serial.printf("[I2C] 0x%02X\n", a); devs++; }
   }
   if (!devs) Serial.println(F("[I2C] No devices found"));
+#ifdef USE_FSK_300
+    if (fskMode) {
+      String info = String("FC=") + frameCounter + " UPT=" + now + "ms CALL=" + MY_CALLSIGN;
+      int txState = fskRadio.transmit(info);
+      if (txState == RADIOLIB_ERR_NONE) {
+        Serial.printf("[TX] FSK txt len=%u\n", (unsigned)info.length());
+        Serial.print("[TX] Info: "); Serial.println(info);
+        char l2[18]; snprintf(l2, sizeof(l2), "FC:%lu", (unsigned long)frameCounter);
+        char l3[18]; strncpy(l3, info.c_str(), 17); l3[17] = '\0';
+        oledLines("FSK Sent", l2, l3, "FSK TXT");
+      } else {
+        Serial.printf("[ERR] FSK TX code=%d\n", txState);
+        oledLines("FSK TX","FAILED");
+      }
+      delay(10);
+      return;
+    }
+#endif
   stageLog("I2C scan complete");
 
   stageStart();
